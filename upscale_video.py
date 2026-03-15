@@ -52,11 +52,21 @@ Encoder:
   Output dims rounded to mod-8. Audio: stream copy if MP4-compatible, else AAC at source bitrate.
 
 Examples:
-  python upscale_video.py input.mp4                                # 4K ULTRA CQ20
-  python upscale_video.py input.mp4 --scale 4 --cq 18             # 4x, near-lossless
-  python upscale_video.py input.mp4 --denoise HIGH                 # denoise + 4K upscale
+# 4K ULTRA CQ20
+  python upscale_video.py input.mp4
+
+# 4x, near-lossless                          
+  python upscale_video.py input.mp4 --scale 4 --cq 18
+
+# Denoise + 4K upscale
+  python upscale_video.py input.mp4 --denoise HIGH
+
+# Denoise + deblur + interpolate frames, no upscale, near-lossless
   python upscale_video.py input.mp4 --deblur ULTRA --denoise ULTRA --double_fps --cq 18
-  python upscale_video.py input.mp4 --scale 1 --denoise ULTRA     # denoise only, no upscale
+
+# Denoise only, no upscale
+  python upscale_video.py input.mp4 --scale 1 --denoise ULTRA
+  
 """
 
 import argparse
