@@ -15,27 +15,22 @@ Requirements:
 Arguments:
   input                 Input video file path (positional, required).
   -o, --output          Output file path.
-                        Default: <input>_<res>p[_<upscale>][_denoise-<level>][_deblur-<level>]_fps<fps>_cq<cq>.mp4
+                        Default: <input>_<res>p[_upscale-<level>][_denoise-<level>][_deblur-<level>]_fps<fps>_cq<cq>.mp4
 
-  --res RES             Target min dimension in pixels (default: 2160 for 4K).
+  --res RES             Target min pixel dimension (default: 2160). Cannot be used with --scale.
                         Auto-computes scale factor (2x, 3x, or 4x).
-                        Cannot be used with --scale.
 
   --scale {1,2,3,4}     Explicit scale factor. Cannot be used with --res.
-                        1 = same resolution (preprocess only)
+                        1 = same resolution
                         2 = 2x   3 = 3x   4 = 4x
 
-  --upscale PRESET      RTX VSR upscale quality (default: ULTRA).
-                        BICUBIC, LOW, MEDIUM, HIGH, ULTRA
+  --upscale PRESET      BICUBIC, LOW, MEDIUM, HIGH, ULTRA
 
-  --denoise PRESET      Denoise before upscaling (reduces grain/noise).
-                        LOW, MEDIUM, HIGH, ULTRA
+  --denoise PRESET      LOW, MEDIUM, HIGH, ULTRA
 
-  --deblur PRESET       Deblur before upscaling (sharpens soft/blurry footage).
-                        LOW, MEDIUM, HIGH, ULTRA
+  --deblur PRESET       LOW, MEDIUM, HIGH, ULTRA
 
   --double_fps          Double the source frame rate via ffmpeg minterpolate blend.
-                        Streamed through raw pipes (no temp file, no re-encode).
 
   --pad                 Pad to mod-8 alignment instead of cropping (default: crop).
                         Preserves all original pixels; adds black border.
@@ -66,7 +61,6 @@ Examples:
 
 # Denoise only, no upscale
   python upscale_video.py input.mp4 --scale 1 --denoise ULTRA
-  
 """
 
 import argparse
@@ -540,8 +534,8 @@ def main():
         pre_bar = None
         if has_preprocess:
             pre_label = "+".join(
-                ([f"Denoise"] if denoise_model else []) +
-                ([f"Deblur"] if deblur_model else [])
+                (["Denoise"] if denoise_model else []) +
+                (["Deblur"] if deblur_model else [])
             )
             pre_bar = tqdm(total=n_frames, unit="f", desc=pre_label) if n_frames else None
 
