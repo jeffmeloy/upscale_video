@@ -15,22 +15,27 @@ Requirements:
 Arguments:
   input                 Input video file path (positional, required).
   -o, --output          Output file path.
-                        Default: <input>_<res>p[_upscale-<level>][_denoise-<level>][_deblur-<level>]_fps<fps>_cq<cq>.mp4
+                        Default: <input>_<res>p[_<upscale>][_denoise-<level>][_deblur-<level>]_fps<fps>_cq<cq>.mp4
 
-  --res RES             Target min pixel dimension (default: 2160). Cannot be used with --scale.
+  --res RES             Target min dimension in pixels (default: 2160 for 4K).
                         Auto-computes scale factor (2x, 3x, or 4x).
+                        Cannot be used with --scale.
 
   --scale {1,2,3,4}     Explicit scale factor. Cannot be used with --res.
-                        1 = same resolution
+                        1 = same resolution (preprocess only)
                         2 = 2x   3 = 3x   4 = 4x
 
-  --upscale PRESET      BICUBIC, LOW, MEDIUM, HIGH, ULTRA
+  --upscale PRESET      RTX VSR upscale quality (default: ULTRA).
+                        BICUBIC, LOW, MEDIUM, HIGH, ULTRA
 
-  --denoise PRESET      LOW, MEDIUM, HIGH, ULTRA
+  --denoise PRESET      Denoise before upscaling (reduces grain/noise).
+                        LOW, MEDIUM, HIGH, ULTRA
 
-  --deblur PRESET       LOW, MEDIUM, HIGH, ULTRA
+  --deblur PRESET       Deblur before upscaling (sharpens soft/blurry footage).
+                        LOW, MEDIUM, HIGH, ULTRA
 
   --double_fps          Double the source frame rate via ffmpeg minterpolate blend.
+                        Streamed through raw pipes (no temp file, no re-encode).
 
   --pad                 Pad to mod-8 alignment instead of cropping (default: crop).
                         Preserves all original pixels; adds black border.
@@ -47,20 +52,11 @@ Encoder:
   Output dims rounded to mod-8. Audio: stream copy if MP4-compatible, else AAC at source bitrate.
 
 Examples:
-# 4K ULTRA CQ20
-  python upscale_video.py input.mp4
-
-# 4x, near-lossless                          
-  python upscale_video.py input.mp4 --scale 4 --cq 18
-
-# Denoise + 4K upscale
-  python upscale_video.py input.mp4 --denoise HIGH
-
-# Denoise + deblur + interpolate frames, no upscale, near-lossless
+  python upscale_video.py input.mp4                                # 4K ULTRA CQ20
+  python upscale_video.py input.mp4 --scale 4 --cq 18             # 4x, near-lossless
+  python upscale_video.py input.mp4 --denoise HIGH                 # denoise + 4K upscale
   python upscale_video.py input.mp4 --deblur ULTRA --denoise ULTRA --double_fps --cq 18
-
-# Denoise only, no upscale
-  python upscale_video.py input.mp4 --scale 1 --denoise ULTRA
+  python upscale_video.py input.mp4 --scale 1 --denoise ULTRA     # denoise only, no upscale
 """
 
 import argparse
@@ -124,6 +120,24 @@ def detect_colorspace(vs):
     return "bt709" if min(w, h) >= 720 else "bt601"
 
 
+def detect_full_range(vs):
+    """Detect whether source uses full (0-255) or limited (16-235) range."""
+    # yuvj* pixel formats are always full range
+    if vs.codec_context.pix_fmt in ("yuvj420p", "yuvj422p", "yuvj444p"):
+        return True
+    # Check explicit color_range metadata (2 = full/JPEG, 1 = limited/MPEG)
+    try:
+        cr = int(vs.codec_context.color_range)
+        if cr == 2:
+            return True
+        if cr == 1:
+            return False
+    except Exception:
+        pass
+    # Default: limited range (vast majority of video content)
+    return False
+
+
 def build_yuv2rgb(name):
     return torch.tensor(_CS_MATRICES[name], dtype=torch.float32, device=DEV)
 
@@ -153,17 +167,32 @@ def probe(path):
         vs.thread_type = "AUTO"
         ctx = vs.codec_context
         return (
-            ctx.width, ctx.height, float(vs.average_rate or 30),
-            vs.frames or 0, len(c.streams.audio) > 0,
+            ctx.width,
+            ctx.height,
+            float(vs.average_rate or 30),
+            vs.frames or 0,
+            len(c.streams.audio) > 0,
             ctx.pix_fmt in ("yuv420p", "yuvj420p"),
         )
 
 
-def open_encoder(path, w, h, fps, cq):
+_CS_PARAMS = {
+    "bt601": {"colorspace": 5, "color_primaries": 5, "color_trc": 6},
+    "bt709": {"colorspace": 1, "color_primaries": 1, "color_trc": 1},
+    "bt2020": {"colorspace": 9, "color_primaries": 9, "color_trc": 14},
+}
+
+
+def open_encoder(path, w, h, fps, cq, cs_name="bt709", full_range=False):
     rate = Fraction(fps).limit_denominator(10000)
     cont = av.open(str(path), mode="w")
     s = cont.add_stream("hevc_nvenc", rate=rate)
     s.width, s.height, s.pix_fmt = w, h, "yuv420p"
+    cs = _CS_PARAMS.get(cs_name, _CS_PARAMS["bt709"])
+    s.codec_context.colorspace = cs["colorspace"]
+    s.codec_context.color_primaries = cs["color_primaries"]
+    s.codec_context.color_trc = cs["color_trc"]
+    s.codec_context.color_range = 2 if full_range else 1  # JPEG=full, MPEG=limited
     s.codec_context.options = {
         "rc": "vbr",
         "cq": str(cq),
@@ -177,8 +206,11 @@ def open_encoder(path, w, h, fps, cq):
 
 def load_model(label, quality_str, in_w, in_h, out_w, out_h, gpu=0):
     """Load a VideoSuperRes model and return it."""
-    print(f"  {label}: {quality_str} ({in_w}x{in_h} -> {out_w}x{out_h})...",
-          end=" ", flush=True)
+    print(
+        f"  {label}: {quality_str} ({in_w}x{in_h} -> {out_w}x{out_h})...",
+        end=" ",
+        flush=True,
+    )
     sr = VideoSuperRes(device=gpu, quality=VideoSuperRes.QualityLevel[quality_str])
     sr.input_width, sr.input_height = in_w, in_h
     sr.output_width, sr.output_height = out_w, out_h
@@ -194,20 +226,33 @@ class MinterpolateStream:
         self.w, self.h = w, h
         self.frame_bytes = w * h * 3
 
-        minterp = (
-            f"minterpolate="
-            f"fps={dst_fps}:"
-            f"mi_mode=blend"
-        )
+        minterp = f"minterpolate=fps={dst_fps}:mi_mode=blend"
         self.proc = subprocess.Popen(
             [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-f", "rawvideo", "-pix_fmt", "rgb24",
-                "-s", f"{w}x{h}", "-r", str(src_fps), "-i", "pipe:0",
-                "-vf", minterp,
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{w}x{h}",
+                "-r",
+                str(src_fps),
+                "-i",
+                "pipe:0",
+                "-vf",
+                minterp,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
             ],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
             bufsize=self.frame_bytes * 4,
         )
         self._write_error = None
@@ -240,9 +285,11 @@ class MinterpolateStream:
                     buf += chunk
                     if len(buf) < self.frame_bytes:
                         continue
-                yield np.frombuffer(buf[: self.frame_bytes], dtype=np.uint8).reshape(
-                    self.h, self.w, 3
-                ).copy()
+                yield (
+                    np.frombuffer(buf[: self.frame_bytes], dtype=np.uint8)
+                    .reshape(self.h, self.w, 3)
+                    .copy()
+                )
                 buf = buf[self.frame_bytes :]
         finally:
             writer.join()
@@ -260,23 +307,41 @@ class MinterpolateStream:
 class FrameIO:
     """Pre-allocated, zero-malloc-per-frame GPU converter."""
 
-    def __init__(self, h, w, out_h, out_w, yuv2rgb, has_preprocess=False,
-                 src_h=None, src_w=None):
+    def __init__(
+        self,
+        h,
+        w,
+        out_h,
+        out_w,
+        yuv2rgb,
+        has_preprocess=False,
+        src_h=None,
+        src_w=None,
+        full_range=False,
+    ):
         self.h, self.w = h, w
+        # Source dimensions (smaller than h,w when padding, equal when cropping)
         self.src_h = src_h or h
         self.src_w = src_w or w
+        self.full_range = full_range
         self.yuv2rgb = yuv2rgb
         self.y_pin = torch.zeros((h, w), dtype=torch.uint8, pin_memory=True)
-        self.uv_pin = torch.zeros((2, h // 2, w // 2), dtype=torch.uint8, pin_memory=True)
+        self.uv_pin = torch.zeros(
+            (2, h // 2, w // 2), dtype=torch.uint8, pin_memory=True
+        )
         self.rgb_pin = torch.zeros((h, w, 3), dtype=torch.uint8, pin_memory=True)
         self.y_gpu = torch.zeros((h, w), dtype=torch.uint8, device=DEV)
         self.uv_gpu_u8 = torch.zeros((2, h // 2, w // 2), dtype=torch.uint8, device=DEV)
-        self.uv_gpu = torch.zeros((1, 2, h // 2, w // 2), dtype=torch.float32, device=DEV)
+        self.uv_gpu = torch.zeros(
+            (1, 2, h // 2, w // 2), dtype=torch.float32, device=DEV
+        )
         self.yuv_chw = torch.zeros((3, h * w), dtype=torch.float32, device=DEV)
         self.input_chw = torch.zeros((3, h, w), dtype=torch.float32, device=DEV)
         self.out_f32 = torch.empty((3, out_h, out_w), dtype=torch.float32, device=DEV)
         self.out_hwc = torch.empty((out_h, out_w, 3), dtype=torch.uint8, device=DEV)
-        self.out_pin = torch.empty((out_h, out_w, 3), dtype=torch.uint8, pin_memory=True)
+        self.out_pin = torch.empty(
+            (out_h, out_w, 3), dtype=torch.uint8, pin_memory=True
+        )
         if has_preprocess:
             self.pre_f32 = torch.empty((3, h, w), dtype=torch.float32, device=DEV)
             self.pre_hwc = torch.empty((h, w, 3), dtype=torch.uint8, device=DEV)
@@ -284,7 +349,9 @@ class FrameIO:
 
     @staticmethod
     def _plane_to_pin(buf, plane, rows, cols):
-        raw = np.frombuffer(plane, np.uint8).reshape(rows, plane.line_size)[:rows, :cols]
+        raw = np.frombuffer(plane, np.uint8).reshape(rows, plane.line_size)[
+            :rows, :cols
+        ]
         buf[:rows, :cols].copy_(torch.from_numpy(np.ascontiguousarray(raw)))
 
     def yuv_to_input(self, frame):
@@ -297,9 +364,15 @@ class FrameIO:
         self.uv_gpu_u8.copy_(self.uv_pin, non_blocking=True)
         self.uv_gpu[0].copy_(self.uv_gpu_u8)
         uv_up = F.interpolate(self.uv_gpu, (h, w), mode="bilinear", align_corners=False)
-        self.yuv_chw[0].copy_(self.y_gpu.view(-1))
-        self.yuv_chw[1].copy_(uv_up[0, 0].view(-1)).sub_(128.0)
-        self.yuv_chw[2].copy_(uv_up[0, 1].view(-1)).sub_(128.0)
+        if self.full_range:
+            self.yuv_chw[0].copy_(self.y_gpu.view(-1))
+            self.yuv_chw[1].copy_(uv_up[0, 0].view(-1)).sub_(128.0)
+            self.yuv_chw[2].copy_(uv_up[0, 1].view(-1)).sub_(128.0)
+        else:
+            # Limited range: Y [16,235] → [0,255], UV [16,240] → centered & scaled
+            self.yuv_chw[0].copy_(self.y_gpu.view(-1)).sub_(16.0).mul_(255.0 / 219.0)
+            self.yuv_chw[1].copy_(uv_up[0, 0].view(-1)).sub_(128.0).mul_(255.0 / 224.0)
+            self.yuv_chw[2].copy_(uv_up[0, 1].view(-1)).sub_(128.0).mul_(255.0 / 224.0)
         torch.mm(self.yuv2rgb, self.yuv_chw, out=self.input_chw.view(3, -1))
         self.input_chw.div_(255.0)
         return self.input_chw
@@ -340,7 +413,9 @@ class FrameIO:
 
     def chw_to_frame(self, chw):
         """(3,H,W) float [0,1] GPU tensor → av.VideoFrame (RGB24). For scale=1 output."""
-        self.out_hwc.copy_(chw.clamp(0.0, 1.0).mul(255.0).to(torch.uint8).permute(1, 2, 0))
+        self.out_hwc.copy_(
+            chw.clamp(0.0, 1.0).mul(255.0).to(torch.uint8).permute(1, 2, 0)
+        )
         self.out_pin.copy_(self.out_hwc)
         torch.cuda.current_stream().synchronize()
         return av.VideoFrame.from_ndarray(self.out_pin.numpy(), format="rgb24")
@@ -365,27 +440,39 @@ def main():
     g.add_argument("--res", type=int, default=None, help="Target min dimension.")
     g.add_argument("--scale", type=int, choices=[1, 2, 3, 4], default=None)
     p.add_argument(
-        "--upscale", default="ULTRA", choices=_UPSCALE_QUALITIES,
+        "--upscale",
+        default="ULTRA",
+        choices=_UPSCALE_QUALITIES,
         help="Upscale quality preset.",
     )
     p.add_argument(
-        "--cq", type=int, default=20,
+        "--cq",
+        type=int,
+        default=20,
         help="Constant quality 0-51 (0=lossless, 20=default, lower=better).",
     )
     p.add_argument(
-        "--denoise", default=None, choices=_PREPROCESS_LEVELS, metavar="LEVEL",
+        "--denoise",
+        default=None,
+        choices=_PREPROCESS_LEVELS,
+        metavar="LEVEL",
         help="Denoise before upscaling (LOW, MEDIUM, HIGH, ULTRA).",
     )
     p.add_argument(
-        "--deblur", default=None, choices=_PREPROCESS_LEVELS, metavar="LEVEL",
+        "--deblur",
+        default=None,
+        choices=_PREPROCESS_LEVELS,
+        metavar="LEVEL",
         help="Deblur before upscaling (LOW, MEDIUM, HIGH, ULTRA).",
     )
     p.add_argument(
-        "--double_fps", action="store_true",
+        "--double_fps",
+        action="store_true",
         help="Double frame rate via ffmpeg minterpolate blend.",
     )
     p.add_argument(
-        "--pad", action="store_true",
+        "--pad",
+        action="store_true",
         help="Pad to mod-8 alignment instead of cropping (preserves all pixels).",
     )
     args = p.parse_args()
@@ -400,15 +487,19 @@ def main():
     est_frames = (2 * n_frames - 1) if do_interp and n_frames else n_frames
 
     scale = (
-        args.scale if args.scale is not None
+        args.scale
+        if args.scale is not None
         else compute_scale(in_w, in_h, args.res or 2160)
     )
     do_upscale = scale > 1
     align_w, align_h = align_dims(in_w, in_h, pad=args.pad)
-    out_w, out_h = (align_w * scale, align_h * scale) if do_upscale else (align_w, align_h)
+    out_w, out_h = (
+        (align_w * scale, align_h * scale) if do_upscale else (align_w, align_h)
+    )
     if max(out_w, out_h) > HEVC_MAX:
         sys.exit(f"Error: {out_w}x{out_h} exceeds HEVC max {HEVC_MAX}")
 
+    # --- Build default output filename ---
     if args.output:
         dst = Path(args.output)
     else:
@@ -427,6 +518,7 @@ def main():
 
     has_preprocess = args.denoise or args.deblur
     do_pad = args.pad and (align_w, align_h) != (in_w, in_h)
+    do_crop = not args.pad and (align_w, align_h) != (in_w, in_h)
 
     if (align_w, align_h) != (in_w, in_h):
         mode = "Pad" if args.pad else "Crop"
@@ -445,14 +537,14 @@ def main():
     print(
         f"Input     : {src}\n"
         f"Resolution: {in_w}x{in_h} -> {out_w}x{out_h}"
-        + (f" ({scale}x)" if do_upscale else "") + "\n"
+        + (f" ({scale}x)" if do_upscale else "")
+        + "\n"
         f"FPS       : {fps:.2f}"
         + (f" -> {out_fps:.1f}" if do_interp else "")
         + (f"  Frames: ~{est_frames}" if est_frames else "")
         + "\n"
         f"Pipeline  : {' → '.join(pipeline_parts)}\n"
-        f"Encode CQ : {args.cq}"
-        + ("\n" "Audio     : no" if not has_audio else "")
+        f"Encode CQ : {args.cq}" + ("\nAudio     : no" if not has_audio else "")
     )
 
     torch.cuda.set_device(0)
@@ -465,16 +557,16 @@ def main():
 
     if args.denoise:
         denoise_model = load_model(
-            "Denoise", f"DENOISE_{args.denoise}",
-            align_w, align_h, align_w, align_h)
+            "Denoise", f"DENOISE_{args.denoise}", align_w, align_h, align_w, align_h
+        )
     if args.deblur:
         deblur_model = load_model(
-            "Deblur", f"DEBLUR_{args.deblur}",
-            align_w, align_h, align_w, align_h)
+            "Deblur", f"DEBLUR_{args.deblur}", align_w, align_h, align_w, align_h
+        )
     if do_upscale:
         upscale_model = load_model(
-            "Upscale", args.upscale,
-            align_w, align_h, out_w, out_h)
+            "Upscale", args.upscale, align_w, align_h, out_w, out_h
+        )
 
     pre_models = [m for m in (denoise_model, deblur_model) if m is not None]
     inp = av.open(str(src))
@@ -482,10 +574,15 @@ def main():
     vs.thread_type = "AUTO"
     is_yuv = vs.codec_context.pix_fmt in ("yuv420p", "yuvj420p")
     cs_name = detect_colorspace(vs)
+    full_range = detect_full_range(vs)
     yuv2rgb = build_yuv2rgb(cs_name)
-    print(f"Colorspace: {cs_name.upper()}")
+    print(
+        f"Colorspace: {cs_name.upper()} ({'full' if full_range else 'limited'} range)"
+    )
 
-    out_cont, vid_stream = open_encoder(dst, out_w, out_h, out_fps, args.cq)
+    out_cont, vid_stream = open_encoder(
+        dst, out_w, out_h, out_fps, args.cq, cs_name, full_range=True
+    )
     print("Encoder   : hevc_nvenc VBR/CQ")
 
     _MP4_AUDIO = {"aac", "mp3", "ac3", "eac3", "flac", "opus", "alac"}
@@ -510,12 +607,21 @@ def main():
             src_abr = aud_in.codec_context.bit_rate or 128_000
             aud_out = out_cont.add_stream("aac", rate=aud_in.rate)
             aud_out.bit_rate = max(src_abr, 128_000)
-            print(f"Audio     : re-encode {codec_name} → AAC {aud_out.bit_rate // 1000}kbps")
+            print(
+                f"Audio     : re-encode {codec_name} → AAC {aud_out.bit_rate // 1000}kbps"
+            )
 
-    fio = FrameIO(align_h, align_w, out_h, out_w, yuv2rgb,
-                  has_preprocess=bool(has_preprocess),
-                  src_h=in_h if do_pad else None,
-                  src_w=in_w if do_pad else None)
+    fio = FrameIO(
+        align_h,
+        align_w,
+        out_h,
+        out_w,
+        yuv2rgb,
+        has_preprocess=bool(has_preprocess),
+        src_h=in_h if do_pad else None,
+        src_w=in_w if do_pad else None,
+        full_range=full_range,
+    )
     print()
     n, t0 = 0, time.time()
 
@@ -534,10 +640,12 @@ def main():
         pre_bar = None
         if has_preprocess:
             pre_label = "+".join(
-                (["Denoise"] if denoise_model else []) +
-                (["Deblur"] if deblur_model else [])
+                ([f"Denoise"] if denoise_model else [])
+                + ([f"Deblur"] if deblur_model else [])
             )
-            pre_bar = tqdm(total=n_frames, unit="f", desc=pre_label) if n_frames else None
+            pre_bar = (
+                tqdm(total=n_frames, unit="f", desc=pre_label) if n_frames else None
+            )
 
         def source_frames():
             for pkt in inp.demux(vs):
@@ -569,7 +677,8 @@ def main():
                 chw = fio.np_rgb_to_input(rgb)
                 if upscale_model:
                     vf = fio.upscale_to_frame(
-                        upscale_model.run(chw, stream_ptr=stream_ptr))
+                        upscale_model.run(chw, stream_ptr=stream_ptr)
+                    )
                 else:
                     vf = fio.chw_to_frame(chw)
                 encode_frame(vf)
@@ -603,7 +712,8 @@ def main():
                     chw = fio.run_preprocess(chw, pre_models, stream_ptr)
                 if upscale_model:
                     vf = fio.upscale_to_frame(
-                        upscale_model.run(chw, stream_ptr=stream_ptr))
+                        upscale_model.run(chw, stream_ptr=stream_ptr)
+                    )
                 else:
                     vf = fio.chw_to_frame(chw)
                 encode_frame(vf)
